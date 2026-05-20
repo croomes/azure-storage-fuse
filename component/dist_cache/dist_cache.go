@@ -17,9 +17,14 @@ import (
 	"github.com/Azure/azure-storage-fuse/v2/internal"
 
 	dcache "github.com/Azure/azure-storage-fuse/v2/internal/dist_cache_client"
+	"golang.org/x/sync/errgroup"
 )
 
 const compName = "dist_cache"
+
+// maxPendingL2Uploads limits the number of concurrent L2 cache uploads when
+// flushing pending chunks at commit time.
+const maxPendingL2Uploads = 8
 
 // DistCacheOptions holds configuration for the distributed cache component.
 type DistCacheOptions struct {
@@ -51,6 +56,12 @@ type DistCacheOptions struct {
 	ChunkSizeMB float64 `config:"chunk-size-mb" yaml:"chunk-size-mb,omitempty"`
 }
 
+// pendingChunk holds a staged chunk's data until the file is committed.
+type pendingChunk struct {
+	offset int64
+	data   []byte
+}
+
 // DistCache is the blobfuse component that sits between the local cache and azstorage,
 // providing a shared distributed cache layer across nodes.
 type DistCache struct {
@@ -67,6 +78,12 @@ type DistCache struct {
 	// time to process the async group-based deletion.
 	dirtyMu    sync.Mutex
 	dirtyFiles map[string]time.Time
+
+	// pendingMu protects pendingWrites. Chunks are buffered here during
+	// StageData and flushed to L2 only after CommitData succeeds, preventing
+	// other nodes from reading partially-written data.
+	pendingMu     sync.Mutex
+	pendingWrites map[string][]pendingChunk
 }
 
 const dirtyTTL = 10 * time.Second
@@ -89,7 +106,8 @@ var _ internal.Component = &DistCache{}
 
 func NewDistCacheComponent() internal.Component {
 	comp := &DistCache{
-		dirtyFiles: make(map[string]time.Time),
+		dirtyFiles:    make(map[string]time.Time),
+		pendingWrites: make(map[string][]pendingChunk),
 	}
 	comp.SetName(compName)
 	return comp
@@ -360,17 +378,45 @@ func (dc *DistCache) StageData(options internal.StageDataOptions) error {
 		return nil
 	}
 
-	// Populate distributed cache (best-effort)
-	// Copy buffer before launching goroutine — caller may reuse it immediately
+	// Buffer the chunk for deferred L2 population at commit time.
+	// This prevents other nodes from seeing partially-written data in L2.
 	dataCopy := make([]byte, len(options.Data))
 	copy(dataCopy, options.Data)
-	go dc.uploadChunkAsync(options.Name, int64(options.Offset), dataCopy)
+
+	dc.pendingMu.Lock()
+	dc.pendingWrites[options.Name] = append(dc.pendingWrites[options.Name], pendingChunk{
+		offset: int64(options.Offset),
+		data:   dataCopy,
+	})
+	dc.pendingMu.Unlock()
+
+	// Mark dirty so local reads also bypass L2 during the write window
+	dc.markDirty(options.Name)
 	return nil
 }
 
 func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
-	// Forward to azstorage — commit doesn't need caching
-	return dc.NextComponent().CommitData(options)
+	// Forward to azstorage first — commit is the source-of-truth operation
+	err := dc.NextComponent().CommitData(options)
+	if err != nil {
+		return err
+	}
+
+	if dc.client == nil {
+		return nil
+	}
+
+	// Drain pending chunks and flush to L2 asynchronously now that the
+	// file is committed in Azure and safe for other nodes to read.
+	dc.pendingMu.Lock()
+	chunks := dc.pendingWrites[options.Name]
+	delete(dc.pendingWrites, options.Name)
+	dc.pendingMu.Unlock()
+
+	if len(chunks) > 0 {
+		go dc.flushPendingToL2(options.Name, chunks)
+	}
+	return nil
 }
 
 // --- Invalidation ---
@@ -378,6 +424,7 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 func (dc *DistCache) DeleteFile(options internal.DeleteFileOptions) error {
 	if dc.client != nil {
 		dc.markDirty(options.Name)
+		dc.clearPending(options.Name)
 		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
 			log.Warn("DistCache::DeleteFile : cache invalidation failed for %s: %v", options.Name, err)
 		}
@@ -388,6 +435,7 @@ func (dc *DistCache) DeleteFile(options internal.DeleteFileOptions) error {
 func (dc *DistCache) RenameFile(options internal.RenameFileOptions) error {
 	if dc.client != nil {
 		dc.markDirty(options.Src)
+		dc.clearPending(options.Src)
 		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Src)); err != nil {
 			log.Warn("DistCache::RenameFile : cache invalidation failed for %s: %v", options.Src, err)
 		}
@@ -398,6 +446,7 @@ func (dc *DistCache) RenameFile(options internal.RenameFileOptions) error {
 func (dc *DistCache) TruncateFile(options internal.TruncateFileOptions) error {
 	if dc.client != nil {
 		dc.markDirty(options.Name)
+		dc.clearPending(options.Name)
 		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
 			log.Warn("DistCache::TruncateFile : cache invalidation failed for %s: %v", options.Name, err)
 		}
@@ -432,6 +481,50 @@ func (dc *DistCache) isDirty(name string) bool {
 // cache invalidation. All chunks of the same file share this group ID.
 func fileGroupID(name string) []byte {
 	return []byte(name)
+}
+
+// clearPending discards any buffered chunks for a file (e.g. on delete/truncate).
+func (dc *DistCache) clearPending(name string) {
+	dc.pendingMu.Lock()
+	delete(dc.pendingWrites, name)
+	dc.pendingMu.Unlock()
+}
+
+// flushPendingToL2 uploads all buffered chunks for a file to the distributed
+// cache. Called asynchronously after CommitData succeeds.
+func (dc *DistCache) flushPendingToL2(name string, chunks []pendingChunk) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxPendingL2Uploads)
+
+	for i := range chunks {
+		chunk := chunks[i]
+		g.Go(func() error {
+			select {
+			case <-gctx.Done():
+				return gctx.Err()
+			default:
+			}
+
+			opts := []dcache.UploadOption{
+				dcache.WithIgnoreLock(true),
+				dcache.WithGroupID(fileGroupID(name)),
+			}
+			if dc.conf.TTLSeconds > 0 {
+				opts = append(opts, dcache.WithTTL(dc.conf.TTLSeconds))
+			}
+
+			if err := dc.client.UploadChunk(gctx, name, chunk.offset, chunk.data, opts...); err != nil {
+				log.Warn("DistCache::flushPendingToL2 : upload failed for %s offset=%d: %v", name, chunk.offset, err)
+			}
+			return nil // best-effort: don't abort other uploads on failure
+		})
+	}
+
+	_ = g.Wait()
+	log.Debug("DistCache::flushPendingToL2 : flushed %d chunks for %s", len(chunks), name)
 }
 
 func (dc *DistCache) populateCache(name string, filePath string) {
