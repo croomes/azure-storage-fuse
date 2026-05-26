@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +24,8 @@ import (
 // mockDCacheClient implements dcacheClient for testing.
 type mockDCacheClient struct {
 	store             map[string][]byte
+	groups            map[string]map[string]bool // groupID -> set of store keys
+	chunkGroupIDs     map[string]string          // storeKey -> groupID (for GetChunkGroupID)
 	downloadFn        func(ctx context.Context, filename string, fileSize int64, w io.Writer, opts ...dcache.DownloadOption) (*dcache.FileMetadata, error)
 	chunkFn           func(ctx context.Context, filename string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error)
 	uploadFn          func(ctx context.Context, filename string, data io.Reader, size int64, opts ...dcache.UploadOption) error
@@ -34,7 +37,9 @@ type mockDCacheClient struct {
 
 func newMockDCacheClient() *mockDCacheClient {
 	return &mockDCacheClient{
-		store: make(map[string][]byte),
+		store:         make(map[string][]byte),
+		groups:        make(map[string]map[string]bool),
+		chunkGroupIDs: make(map[string]string),
 	}
 }
 
@@ -94,14 +99,38 @@ func (m *mockDCacheClient) Delete(_ context.Context, filename string, _ int64) e
 func (m *mockDCacheClient) DeleteGroup(_ context.Context, groupID []byte) error {
 	m.deleteGroupCalled++
 	m.lastDeletedGroup = string(groupID)
-	// Remove all entries whose key starts with the group ID (filename)
-	prefix := string(groupID)
-	for k := range m.store {
-		if k == prefix || len(k) > len(prefix) && k[:len(prefix)] == prefix {
+	// The versioned group ID has format "filename\x00vN". Extract the filename
+	// prefix and remove all store entries that belong to that file.
+	gid := string(groupID)
+	fileName := gid
+	if idx := strings.IndexByte(gid, '\x00'); idx >= 0 {
+		fileName = gid[:idx]
+	}
+	// Track which keys belong to which group. Remove entries registered under
+	// this exact group ID.
+	if keys, ok := m.groups[gid]; ok {
+		for k := range keys {
 			delete(m.store, k)
+		}
+		delete(m.groups, gid)
+	} else {
+		// Fallback: remove entries whose key starts with the filename
+		for k := range m.store {
+			if k == fileName || (len(k) > len(fileName) && k[:len(fileName)] == fileName && (k[len(fileName)] == ':' || k[len(fileName)] == '\x00')) {
+				delete(m.store, k)
+			}
 		}
 	}
 	return nil
+}
+
+func (m *mockDCacheClient) GetChunkGroupID(_ context.Context, filename string) ([]byte, error) {
+	// Check if a group ID was recorded for chunk 0 of this file
+	key := fmt.Sprintf("%s:0", filename)
+	if gid, ok := m.chunkGroupIDs[key]; ok {
+		return []byte(gid), nil
+	}
+	return nil, dcache.ErrNotFound
 }
 
 func (m *mockDCacheClient) GetAttr(_ context.Context, _ string) (*dcache.FileAttr, error) {
@@ -187,6 +216,7 @@ func newTestDistCache(mock *mockDCacheClient, next *mockNextComponent) *DistCach
 		dirtyFiles:    make(map[string]time.Time),
 		pendingWrites: make(map[string]*pendingFile),
 		flushCancel:   make(map[string]context.CancelFunc),
+		fileVersions:  make(map[string]uint64),
 		stopCleanup:   make(chan struct{}),
 	}
 	dc.SetName(compName)
@@ -464,7 +494,7 @@ func TestStageData_SizeCapEvictsPending(t *testing.T) {
 
 	// Old L2 chunks should be invalidated to prevent stale reads after dirtyTTL
 	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 entry on size cap")
-	assert.Equal(t, "test/big.bin", mock.lastDeletedGroup)
+	assert.Equal(t, "test/big.bin\x00v0", mock.lastDeletedGroup)
 	_, exists = mock.store["test/big.bin:0"]
 	assert.False(t, exists, "old L2 chunk should be deleted")
 	_, exists = mock.store["test/big.bin:524288"]
@@ -516,7 +546,7 @@ func TestCommitData_ForwardOnly(t *testing.T) {
 	assert.Equal(t, 1, next.commitDataCalled)
 	// CommitData should always invalidate old L2 entries
 	assert.Equal(t, 1, mock.deleteGroupCalled)
-	assert.Equal(t, "test/file.bin", mock.lastDeletedGroup)
+	assert.Equal(t, "test/file.bin\x00v0", mock.lastDeletedGroup)
 }
 
 func TestCommitData_FlushesPendingToL2(t *testing.T) {
@@ -559,7 +589,7 @@ func TestCommitData_FlushesPendingToL2(t *testing.T) {
 
 	// DeleteGroup should have been called to invalidate old L2 data
 	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 before flushing new data")
-	assert.Equal(t, "test/file.bin", mock.lastDeletedGroup)
+	assert.Equal(t, "test/file.bin\x00v0", mock.lastDeletedGroup)
 
 	// Old chunk beyond new file extent should be gone
 	_, exists = mock.store["test/file.bin:8192"]
@@ -903,7 +933,7 @@ func TestCopyFromFile_InvalidatesL2(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, next.copyFromFileCalled, "should write-through to azstorage")
 	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 entry")
-	assert.Equal(t, "test/file.txt", mock.lastDeletedGroup, "should delete the correct group")
+	assert.Equal(t, "test/file.txt\x00v0", mock.lastDeletedGroup, "should delete the correct group")
 
 	// Verify old chunks were removed
 	_, exists := mock.store["test/file.txt"]
@@ -1013,3 +1043,54 @@ func TestCopyFromFile_NilClientPassesThrough(t *testing.T) {
 	assert.Equal(t, 1, next.copyFromFileCalled)
 	assert.False(t, dc.isDirty("test/nil-client.txt"), "should not mark dirty when client is nil")
 }
+
+func TestCommitData_CrossRestart_ResolvesServerGroupID(t *testing.T) {
+	// Simulate: pre-crash, chunks were uploaded under version 3 (group "file\x00v3").
+	// After restart, local fileVersions resets to 0. The server still has chunks
+	// with group "file\x00v3". On a new write, resolveServerGroupID should query
+	// the server and delete the correct group.
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	// Simulate pre-crash state: chunks on server with a group ID from a previous process
+	oldGroupID := "test/file.bin\x00v3"
+	mock.store["test/file.bin:0"] = []byte("old-chunk-0")
+	mock.store["test/file.bin:4096"] = []byte("old-chunk-1")
+	// Register these in chunkGroupIDs so GetChunkGroupID can find them
+	mock.chunkGroupIDs["test/file.bin:0"] = oldGroupID
+	// Register in groups for DeleteGroup to clean them up
+	mock.groups[oldGroupID] = map[string]bool{
+		"test/file.bin:0":    true,
+		"test/file.bin:4096": true,
+	}
+
+	// Local version is 0 (simulating post-restart state)
+	assert.Equal(t, uint64(0), dc.getVersion("test/file.bin"))
+
+	// Stage and commit new data
+	err := dc.StageData(internal.StageDataOptions{
+		Name: "test/file.bin", Offset: 0, Data: []byte("new-data"), Id: "b0",
+	})
+	require.NoError(t, err)
+
+	err = dc.CommitData(internal.CommitDataOptions{
+		Name: "test/file.bin",
+		List: []string{"b0"},
+	})
+	require.NoError(t, err)
+
+	// Should have queried server and deleted the correct old group (v3, not v0)
+	assert.Equal(t, 1, mock.deleteGroupCalled)
+	assert.Equal(t, oldGroupID, mock.lastDeletedGroup, "should delete server-side group ID, not stale local version")
+
+	// Old chunks should be gone
+	_, exists := mock.store["test/file.bin:0"]
+	assert.False(t, exists, "old chunk 0 should be deleted via server-resolved group ID")
+	_, exists = mock.store["test/file.bin:4096"]
+	assert.False(t, exists, "old chunk 1 should be deleted via server-resolved group ID")
+
+	// Local version should have been bumped
+	assert.Equal(t, uint64(1), dc.getVersion("test/file.bin"))
+}
+
