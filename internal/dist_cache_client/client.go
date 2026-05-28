@@ -66,7 +66,8 @@ func New(opts ...Option) (*Client, error) {
 
 // Upload stores a file in the distributed cache, splitting it into chunks.
 // Each chunk is routed to a server via consistent hash of its chunk key.
-func (c *Client) Upload(ctx context.Context, filename string, data io.Reader, size int64, opts ...UploadOption) error {
+// The etag is included in the cache key so each blob revision occupies a distinct slot.
+func (c *Client) Upload(ctx context.Context, filename, etag string, data io.Reader, size int64, opts ...UploadOption) error {
 	if err := c.checkClosed(); err != nil {
 		return err
 	}
@@ -76,7 +77,7 @@ func (c *Client) Upload(ctx context.Context, filename string, data io.Reader, si
 		o(ucfg)
 	}
 
-	return c.uploadChunked(ctx, filename, data, size, ucfg)
+	return c.uploadChunked(ctx, filename, etag, data, size, ucfg)
 }
 
 // Download retrieves a complete file from the distributed cache, reassembling chunks.
@@ -98,7 +99,7 @@ func (c *Client) Download(ctx context.Context, filename string, w io.Writer, opt
 		return nil, err
 	}
 
-	return c.downloadChunked(ctx, filename, int64(attr.Size), w, dcfg)
+	return c.downloadChunked(ctx, filename, "", int64(attr.Size), w, dcfg)
 }
 
 // DownloadWithSize retrieves a file when the size is already known (avoids GetAttr call).
@@ -112,7 +113,7 @@ func (c *Client) DownloadWithSize(ctx context.Context, filename string, fileSize
 		o(dcfg)
 	}
 
-	return c.downloadChunked(ctx, filename, fileSize, w, dcfg)
+	return c.downloadChunked(ctx, filename, "", fileSize, w, dcfg)
 }
 
 // DownloadWithSizePartial retrieves a file, streaming per-chunk miss errors
@@ -124,7 +125,7 @@ func (c *Client) DownloadWithSize(ctx context.Context, filename string, fileSize
 // The returned channel is closed when all chunk download attempts complete.
 // Call the returned wait function to block until completion and get any fatal error.
 // A non-nil error return indicates a setup failure (closed client, bad plan).
-func (c *Client) DownloadWithSizePartial(ctx context.Context, filename string, fileSize int64, w io.WriterAt, opts ...DownloadOption) (<-chan ChunkError, func() error, error) {
+func (c *Client) DownloadWithSizePartial(ctx context.Context, filename, etag string, fileSize int64, w io.WriterAt, opts ...DownloadOption) (<-chan ChunkError, func() error, error) {
 	if err := c.checkClosed(); err != nil {
 		return nil, nil, err
 	}
@@ -134,7 +135,7 @@ func (c *Client) DownloadWithSizePartial(ctx context.Context, filename string, f
 		o(dcfg)
 	}
 
-	plans, err := c.planChunks(filename, fileSize)
+	plans, err := c.planChunks(filename, etag, fileSize)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -216,7 +217,7 @@ func (c *Client) DownloadWithSizePartial(ctx context.Context, filename string, f
 // DownloadChunk retrieves a single chunk at the given offset.
 // When chunkSize-aligned, this is a 1:1 mapping to one distributed cache entry.
 // Ideal for block_cache integration where each ReadInBuffer = one chunk.
-func (c *Client) DownloadChunk(ctx context.Context, filename string, offset int64, buf []byte, opts ...DownloadOption) (int, error) {
+func (c *Client) DownloadChunk(ctx context.Context, filename, etag string, offset int64, buf []byte, opts ...DownloadOption) (int, error) {
 	if err := c.checkClosed(); err != nil {
 		return 0, err
 	}
@@ -226,7 +227,7 @@ func (c *Client) DownloadChunk(ctx context.Context, filename string, offset int6
 		o(dcfg)
 	}
 
-	cacheKey := GenerateCacheKey(c.cfg.cachePrefix, filename, offset, c.cfg.chunkSize)
+	cacheKey := GenerateCacheKey(c.cfg.cachePrefix, filename, etag, offset, c.cfg.chunkSize)
 	server, err := c.disc.getServer(cacheKey)
 	if err != nil {
 		return 0, err
@@ -247,12 +248,12 @@ func (c *Client) DownloadChunk(ctx context.Context, filename string, offset int6
 // the given file. This allows callers to discover which group ID was used when
 // uploading, even across process restarts. Returns nil if the chunk doesn't
 // exist or has no "gid" metadata.
-func (c *Client) GetChunkGroupID(ctx context.Context, filename string) ([]byte, error) {
+func (c *Client) GetChunkGroupID(ctx context.Context, filename, etag string) ([]byte, error) {
 	if err := c.checkClosed(); err != nil {
 		return nil, err
 	}
 
-	cacheKey := GenerateCacheKey(c.cfg.cachePrefix, filename, 0, c.cfg.chunkSize)
+	cacheKey := GenerateCacheKey(c.cfg.cachePrefix, filename, etag, 0, c.cfg.chunkSize)
 	server, err := c.disc.getServer(cacheKey)
 	if err != nil {
 		return nil, err
@@ -316,7 +317,7 @@ func (c *Client) GetChunkGroupID(ctx context.Context, filename string) ([]byte, 
 
 // UploadChunk stores a single chunk at the given offset.
 // Ideal for block_cache StageData integration.
-func (c *Client) UploadChunk(ctx context.Context, filename string, offset int64, data []byte, opts ...UploadOption) error {
+func (c *Client) UploadChunk(ctx context.Context, filename, etag string, offset int64, data []byte, opts ...UploadOption) error {
 	if err := c.checkClosed(); err != nil {
 		return err
 	}
@@ -326,7 +327,7 @@ func (c *Client) UploadChunk(ctx context.Context, filename string, offset int64,
 		o(ucfg)
 	}
 
-	cacheKey := GenerateCacheKey(c.cfg.cachePrefix, filename, offset, c.cfg.chunkSize)
+	cacheKey := GenerateCacheKey(c.cfg.cachePrefix, filename, etag, offset, c.cfg.chunkSize)
 	server, err := c.disc.getServer(cacheKey)
 	if err != nil {
 		return err
@@ -348,7 +349,7 @@ func (c *Client) Delete(ctx context.Context, filename string, fileSize int64) er
 		return err
 	}
 
-	plans, err := c.planChunks(filename, fileSize)
+	plans, err := c.planChunks(filename, "", fileSize)
 	if err != nil {
 		return err
 	}

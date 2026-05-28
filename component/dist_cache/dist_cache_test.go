@@ -43,7 +43,7 @@ func newMockDCacheClient() *mockDCacheClient {
 	}
 }
 
-func (m *mockDCacheClient) Upload(ctx context.Context, filename string, data io.Reader, size int64, opts ...dcache.UploadOption) error {
+func (m *mockDCacheClient) Upload(ctx context.Context, filename, etag string, data io.Reader, size int64, opts ...dcache.UploadOption) error {
 	if m.uploadFn != nil {
 		return m.uploadFn(ctx, filename, data, size, opts...)
 	}
@@ -53,10 +53,9 @@ func (m *mockDCacheClient) Upload(ctx context.Context, filename string, data io.
 	return nil
 }
 
-func (m *mockDCacheClient) DownloadWithSizePartial(ctx context.Context, filename string, fileSize int64, w io.WriterAt, opts ...dcache.DownloadOption) (<-chan dcache.ChunkError, func() error, error) {
+func (m *mockDCacheClient) DownloadWithSizePartial(ctx context.Context, filename, etag string, fileSize int64, w io.WriterAt, opts ...dcache.DownloadOption) (<-chan dcache.ChunkError, func() error, error) {
 	var chunkErrors []dcache.ChunkError
 	var fatalErr error
-
 	if m.downloadPartialFn != nil {
 		chunkErrors, fatalErr = m.downloadPartialFn(ctx, filename, fileSize, w, opts...)
 	} else {
@@ -78,7 +77,7 @@ func (m *mockDCacheClient) DownloadWithSizePartial(ctx context.Context, filename
 	return ch, func() error { return fatalErr }, nil
 }
 
-func (m *mockDCacheClient) DownloadChunk(ctx context.Context, filename string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error) {
+func (m *mockDCacheClient) DownloadChunk(ctx context.Context, filename, etag string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error) {
 	if m.chunkFn != nil {
 		return m.chunkFn(ctx, filename, offset, buf, opts...)
 	}
@@ -91,7 +90,7 @@ func (m *mockDCacheClient) DownloadChunk(ctx context.Context, filename string, o
 	return n, nil
 }
 
-func (m *mockDCacheClient) UploadChunk(ctx context.Context, filename string, offset int64, data []byte, _ ...dcache.UploadOption) error {
+func (m *mockDCacheClient) UploadChunk(ctx context.Context, filename, etag string, offset int64, data []byte, _ ...dcache.UploadOption) error {
 	if m.uploadChunkFn != nil {
 		return m.uploadChunkFn(ctx, filename, offset, data)
 	}
@@ -134,7 +133,7 @@ func (m *mockDCacheClient) DeleteGroup(_ context.Context, groupID []byte) error 
 	return nil
 }
 
-func (m *mockDCacheClient) GetChunkGroupID(_ context.Context, filename string) ([]byte, error) {
+func (m *mockDCacheClient) GetChunkGroupID(_ context.Context, filename, etag string) ([]byte, error) {
 	// Check if a group ID was recorded for chunk 0 of this file
 	key := fmt.Sprintf("%s:0", filename)
 	if gid, ok := m.chunkGroupIDs[key]; ok {
@@ -170,6 +169,14 @@ type mockNextComponent struct {
 	copyToFileData   []byte // data written on CopyToFile
 	readInBufferData []byte // data returned by ReadInBuffer
 	readInBufferFn   func(options *internal.ReadInBufferOptions) (int, error)
+	getAttrETag      string // ETag returned by GetAttr (empty = new file)
+}
+
+func (m *mockNextComponent) GetAttr(_ internal.GetAttrOptions) (*internal.ObjAttr, error) {
+	if m.getAttrETag == "" {
+		return &internal.ObjAttr{}, nil
+	}
+	return &internal.ObjAttr{ETag: m.getAttrETag}, nil
 }
 
 func (m *mockNextComponent) CopyToFile(options internal.CopyToFileOptions) error {
@@ -231,7 +238,6 @@ func newTestDistCache(mock *mockDCacheClient, next *mockNextComponent) *DistCach
 		pendingWrites:     make(map[string]*pendingFile),
 		flushCancel:       make(map[string]context.CancelFunc),
 		readUploadCancels: make(map[string]*readUploadEntry),
-		fileVersions:      make(map[string]uint64),
 		stopCleanup:       make(chan struct{}),
 	}
 	dc.SetName(compName)
@@ -638,7 +644,7 @@ func TestEvictStalePending(t *testing.T) {
 
 func TestCommitData_ForwardOnly(t *testing.T) {
 	mock := newMockDCacheClient()
-	next := &mockNextComponent{}
+	next := &mockNextComponent{getAttrETag: "existingetag"}
 	dc := newTestDistCache(mock, next)
 
 	err := dc.CommitData(internal.CommitDataOptions{
@@ -650,12 +656,12 @@ func TestCommitData_ForwardOnly(t *testing.T) {
 	assert.Equal(t, 1, next.commitDataCalled)
 	// CommitData should always invalidate old L2 entries
 	assert.Equal(t, 1, mock.deleteGroupCalled)
-	assert.Equal(t, "test/file.bin\x00v0", mock.lastDeletedGroup)
+	assert.Equal(t, "test/file.bin\x00vexistingetag", mock.lastDeletedGroup)
 }
 
 func TestCommitData_FlushesPendingToL2(t *testing.T) {
 	mock := newMockDCacheClient()
-	next := &mockNextComponent{}
+	next := &mockNextComponent{getAttrETag: "oldetag"}
 	dc := newTestDistCache(mock, next)
 
 	// Pre-populate L2 with old chunks (simulating a previously cached file)
@@ -693,7 +699,7 @@ func TestCommitData_FlushesPendingToL2(t *testing.T) {
 
 	// DeleteGroup should have been called to invalidate old L2 data
 	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 before flushing new data")
-	assert.Equal(t, "test/file.bin\x00v0", mock.lastDeletedGroup)
+	assert.Equal(t, "test/file.bin\x00voldetag", mock.lastDeletedGroup)
 
 	// Old chunk beyond new file extent should be gone
 	_, exists = mock.store["test/file.bin:8192"]
@@ -781,7 +787,7 @@ func TestCommitData_CancelsPreviousFlush(t *testing.T) {
 
 func TestDeleteFile_Invalidation(t *testing.T) {
 	mock := newMockDCacheClient()
-	next := &mockNextComponent{}
+	next := &mockNextComponent{getAttrETag: "deleteetag"}
 	dc := newTestDistCache(mock, next)
 
 	mock.store["test/file.txt"] = []byte("cached data")
@@ -796,7 +802,7 @@ func TestDeleteFile_Invalidation(t *testing.T) {
 
 func TestRenameFile_Invalidation(t *testing.T) {
 	mock := newMockDCacheClient()
-	next := &mockNextComponent{}
+	next := &mockNextComponent{getAttrETag: "renameetag"}
 	dc := newTestDistCache(mock, next)
 
 	mock.store["old-name.txt"] = []byte("data")
@@ -1001,6 +1007,7 @@ func TestCopyToFile_ChunkPollTimeout_FallsThrough(t *testing.T) {
 func TestCopyFromFile_InvalidatesL2(t *testing.T) {
 	mock := newMockDCacheClient()
 	next := &mockNextComponent{}
+	next.getAttrETag = "oldetag123"
 	dc := newTestDistCache(mock, next)
 
 	// Pre-populate L2 with old data (simulating stale cached file)
@@ -1019,10 +1026,11 @@ func TestCopyFromFile_InvalidatesL2(t *testing.T) {
 		File: f,
 	})
 
+	expectedGroup := "test/file.txt\x00voldetag123"
 	assert.NoError(t, err)
 	assert.Equal(t, 1, next.copyFromFileCalled, "should write-through to azstorage")
 	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 entry")
-	assert.Equal(t, "test/file.txt\x00v0", mock.lastDeletedGroup, "should delete the correct group")
+	assert.Equal(t, expectedGroup, mock.lastDeletedGroup, "should delete the correct group")
 
 	// Verify old chunks were removed
 	_, exists := mock.store["test/file.txt"]
@@ -1134,54 +1142,45 @@ func TestCopyFromFile_NilClientPassesThrough(t *testing.T) {
 	assert.False(t, dc.isDirty("test/nil-client.txt"), "should not mark dirty when client is nil")
 }
 
-func TestCommitData_CrossRestart_ResolvesServerGroupID(t *testing.T) {
-	// Simulate: pre-crash, chunks were uploaded under version 3 (group "file\x00v3").
-	// After restart, local fileVersions resets to 0. The server still has chunks
-	// with group "file\x00v3". On a new write, resolveServerGroupID should query
-	// the server and delete the correct group.
+func TestCommitData_DeletesOldETagGroup(t *testing.T) {
+	// Simulate: a file exists with ETag-A in Azure. A new commit produces ETag-B.
+	// CommitData should GetAttr to find ETag-A, commit, then DeleteGroup(ETag-A).
 	mock := newMockDCacheClient()
-	next := &mockNextComponent{}
+	next := &mockNextComponent{getAttrETag: "0x8DC3A2B1C4E5F6A7"}
 	dc := newTestDistCache(mock, next)
 
-	// Simulate pre-crash state: chunks on server with a group ID from a previous process
-	oldGroupID := "test/file.bin\x00v3"
+	// Simulate pre-existing chunks cached under old ETag
+	oldGroupID := "test/file.bin\x00v0x8DC3A2B1C4E5F6A7"
 	mock.store["test/file.bin:0"] = []byte("old-chunk-0")
 	mock.store["test/file.bin:4096"] = []byte("old-chunk-1")
-	// Register these in chunkGroupIDs so GetChunkGroupID can find them
-	mock.chunkGroupIDs["test/file.bin:0"] = oldGroupID
-	// Register in groups for DeleteGroup to clean them up
 	mock.groups[oldGroupID] = map[string]bool{
 		"test/file.bin:0":    true,
 		"test/file.bin:4096": true,
 	}
 
-	// Local version is 0 (simulating post-restart state)
-	assert.Equal(t, uint64(0), dc.getVersion("test/file.bin"))
-
-	// Stage and commit new data
+	// Stage and commit new data (simulating block_cache providing new ETag)
+	newETag := "0x8DC4B3C2D5F607B8"
 	err := dc.StageData(internal.StageDataOptions{
 		Name: "test/file.bin", Offset: 0, Data: []byte("new-data"), Id: "b0",
 	})
 	require.NoError(t, err)
 
 	err = dc.CommitData(internal.CommitDataOptions{
-		Name: "test/file.bin",
-		List: []string{"b0"},
+		Name:    "test/file.bin",
+		List:    []string{"b0"},
+		NewETag: &newETag,
 	})
 	require.NoError(t, err)
 
-	// Should have queried server and deleted the correct old group (v3, not v0)
+	// Should have deleted the old ETag group
 	assert.Equal(t, 1, mock.deleteGroupCalled)
-	assert.Equal(t, oldGroupID, mock.lastDeletedGroup, "should delete server-side group ID, not stale local version")
+	assert.Equal(t, oldGroupID, mock.lastDeletedGroup, "should delete old ETag group")
 
 	// Old chunks should be gone
 	_, exists := mock.store["test/file.bin:0"]
-	assert.False(t, exists, "old chunk 0 should be deleted via server-resolved group ID")
+	assert.False(t, exists, "old chunk 0 should be deleted via old ETag group")
 	_, exists = mock.store["test/file.bin:4096"]
-	assert.False(t, exists, "old chunk 1 should be deleted via server-resolved group ID")
-
-	// Local version should have been synced to server (v3) then bumped to v4
-	assert.Equal(t, uint64(4), dc.getVersion("test/file.bin"))
+	assert.False(t, exists, "old chunk 1 should be deleted via old ETag group")
 }
 
 func TestReadUploadCancelled_OnCommitData(t *testing.T) {
