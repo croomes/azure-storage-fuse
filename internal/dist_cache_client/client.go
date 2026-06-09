@@ -147,6 +147,8 @@ func (c *Client) DownloadWithSizePartial(ctx context.Context, filename string, f
 		return chunkErrCh, func() error { return nil }, nil
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+
 	var fatalErr error
 	var fatalOnce sync.Once
 	var wg sync.WaitGroup
@@ -160,7 +162,13 @@ func (c *Client) DownloadWithSizePartial(ctx context.Context, filename string, f
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}        // acquire
+
+			// Acquire semaphore or bail out on cancellation
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }() // release
 
 			buf := c.getBuffer()
@@ -176,14 +184,20 @@ func (c *Client) DownloadWithSizePartial(ctx context.Context, filename string, f
 					}
 					return
 				}
-				// Fatal error
-				fatalOnce.Do(func() { fatalErr = dlErr })
+				// Fatal error — cancel remaining downloads
+				fatalOnce.Do(func() {
+					fatalErr = dlErr
+					cancel()
+				})
 				return
 			}
 			_, writeErr := w.WriteAt(buf[:n], plan.offset)
 			c.putBuffer(buf)
 			if writeErr != nil {
-				fatalOnce.Do(func() { fatalErr = writeErr })
+				fatalOnce.Do(func() {
+					fatalErr = writeErr
+					cancel()
+				})
 			}
 		}()
 	}
@@ -191,6 +205,7 @@ func (c *Client) DownloadWithSizePartial(ctx context.Context, filename string, f
 	// Wait function: blocks until all downloads finish, closes channel, returns fatal error
 	wait := func() error {
 		wg.Wait()
+		cancel() // ensure context resources are released
 		close(chunkErrCh)
 		return fatalErr
 	}

@@ -237,7 +237,8 @@ func (dc *DistCache) CopyToFile(options internal.CopyToFileOptions) error {
 		return dc.NextComponent().CopyToFile(options)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Start distributed cache download — chunk misses stream to chunkErrCh immediately
 	chunkErrCh, wait, err := dc.client.DownloadWithSizePartial(ctx, options.Name, options.Count, options.File,
@@ -288,6 +289,9 @@ func (dc *DistCache) CopyToFile(options internal.CopyToFileOptions) error {
 
 	// Wait for all cache downloads to finish (closes chunkErrCh)
 	if fatalErr := wait(); fatalErr != nil {
+		cancel() // cancel recovery goroutines
+		<-readerDone
+		g.Wait() // drain in-flight recovery work before returning
 		if dc.bypassOnError {
 			log.Warn("DistCache::CopyToFile : fatal download error, bypassing: %v", fatalErr)
 			return dc.NextComponent().CopyToFile(options)
