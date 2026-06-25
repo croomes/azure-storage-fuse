@@ -930,8 +930,11 @@ func (suite *fileCacheDistCacheSuite) SetupTest() {
 	suite.srv = newIntegMockServer(suite.T())
 
 	// Build config: file_cache → dist_cache → loopbackfs
+	// timeout-sec must be > 0 so the local cache file survives long enough for
+	// dist_cache's async L2 populate goroutine to re-open it after Release.
+	// Keep it small so tests that need to observe eviction can sleep through it.
 	cfg := fmt.Sprintf(
-		"file_cache:\n  path: %s\n  offload-io: true\n  timeout-sec: 0\n\n"+
+		"file_cache:\n  path: %s\n  offload-io: true\n  timeout-sec: 2\n\n"+
 			"dist_cache:\n  server-list: %s\n  bypass-on-error: true\n  chunk-size-mb: 1\n  cache-prefix: test/container\n\n"+
 			"loopbackfs:\n  path: %s\n",
 		suite.cachePath, suite.srv.addr, suite.storagePath)
@@ -1236,15 +1239,19 @@ func (suite *fileCacheDistCacheSuite) TestWriteThenRead_FullPipeline() {
 	err = suite.fileCache.ReleaseFile(internal.ReleaseFileOptions{Handle: handle})
 	suite.assert.NoError(err)
 
-	// Wait for L1 eviction (timeout-sec: 0) and L2 population
-	time.Sleep(300 * time.Millisecond)
+	// Wait for L1 eviction and L2 population. file_cache's eviction worker ticks
+	// every timeout-sec (2s) and removes files idle for >= timeout-sec, so worst
+	// case is ~2x timeout-sec. Poll up to ~5s and assert eviction actually happened.
 	localPath := filepath.Join(suite.cachePath, fileName)
-	for i := 0; i < 10; i++ {
+	evicted := false
+	for i := 0; i < 25; i++ {
 		if _, err := os.Stat(localPath); os.IsNotExist(err) {
+			evicted = true
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	suite.assert.True(evicted, "local cache file should be evicted within ~5s")
 
 	// Clear dirty so L2 is used
 	suite.distCache.clearDirty(fileName)
