@@ -149,7 +149,7 @@ blobfuse2 mount /mnt/blobfuse --config-file=config.yaml \
 | `bypass-on-error` | bool | false | Fall through to Azure on cache errors |
 | `ttl-seconds` | int | 0 | TTL for cached data (0 = no expiry) |
 | `chunk-size-mb` | float | 16 | Chunk size when block_cache is not present |
-| `cache-prefix` | string | | Prefix for cache keys |
+| `cache-prefix` | string | `<account-name>/<container>` | Optional override for cache key prefix; defaults to azstorage account/container |
 | `max-conns-per-server` | int | 8 | Max TCP connections per cache server |
 | `request-timeout-sec` | int | 30 | Per-request timeout |
 | `auth-account-name` | string | | Cache auth account (if auth enabled) |
