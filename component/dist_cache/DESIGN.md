@@ -448,7 +448,6 @@ func New(opts ...Option) (*Client, error)
 func WithServerList(servers []string) Option
 func WithDiscoveryURL(url string) Option
 func WithPort(port int) Option
-func WithAuth(accountName, accountKey string) Option
 func WithChunkSize(size int64) Option                // default 16 MiB; 32 MiB recommended for production
 func WithCachePrefix(prefix string) Option           // e.g., "accountName/containerName"
 func WithMaxConnsPerServer(n int) Option
