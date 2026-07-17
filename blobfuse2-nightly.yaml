@@ -1394,10 +1394,7 @@ stages:
                 delete_containers: true
 
   # -----------------------------------------------------------------------
-  # Distributed cache E2E (TEST_PLAN.md §4, items 115-124 / closes item 149).
-  # Gated on the `dist_cache_test` parameter so nightly runs stay green until
-  # the ACR image tag + chart version are populated below. Queue a manual run
-  # with the parameter set to true.
+  # Distributed cache E2E
   - ${{ if eq(parameters.dist_cache_test, true) }}:
     - stage: DistCacheValidation
       dependsOn: BuildAndTest
@@ -1430,19 +1427,21 @@ stages:
               value: '$(Pipeline.Workspace)/blobfuse2_dcache_block_directio.yaml'
             - name: BLOBFUSE2_DCACHE_FILE_DIO_CFG
               value: '$(Pipeline.Workspace)/blobfuse2_dcache_file_directio.yaml'
-            # TBD: fill these in from a pipeline variable group (NightlyBlobFuse)
-            # once the ACR + Tachyon image tag + chart version are known.
+            # Tachyon ACR / image / chart coordinates. Leaving _TAG and
+            # _CHART_VERSION empty tells deploy-tachyon.sh to resolve the
+            # latest tag published to the ACR at runtime (via
+            # `az acr repository show-tags --orderby time_desc --top 1`).
             - name: CACHE_SERVER_IMAGE_REGISTRY
-              value: ''  # e.g. myacr.azurecr.io
+              value: 'tachyonprodacr.azurecr.io'
             - name: CACHE_SERVER_IMAGE_REPO
               value: 'cache-server'
             - name: CACHE_SERVER_IMAGE_TAG
-              value: ''  # e.g. 1.2.3
+              value: ''  # empty = latest tag from ACR
             # Helm chart is pulled directly from ACR via OCI (no source checkout).
             # Defaults to the same registry as the image; override only if the
             # chart lives in a different ACR.
             - name: CACHE_SERVER_CHART_REGISTRY
-              value: ''  # e.g. myacr.azurecr.io (defaults to CACHE_SERVER_IMAGE_REGISTRY)
+              value: ''  # empty = defaults to CACHE_SERVER_IMAGE_REGISTRY
             - name: CACHE_SERVER_CHART_REPO
               value: 'charts/cache-server'
             # cache-server-prereq chart is installed first (CRDs / RBAC /
@@ -1451,7 +1450,7 @@ stages:
             - name: CACHE_SERVER_PREREQ_CHART_REPO
               value: 'charts/cache-server-prereq'
             - name: CACHE_SERVER_CHART_VERSION
-              value: ''  # e.g. 1.2.3
+              value: ''  # empty = latest chart version from ACR
             - name: GOPATH
               value: '$(Pipeline.Workspace)/go'
             - name: ROOT_DIR

@@ -9,9 +9,6 @@
 # single expensive cluster setup amortise across multiple dist_cache modes
 # (block/file cache, direct-io on/off, ...).
 #
-# See test/scripts/dcache/PLAN.md for why kind (rather than the minikube path
-# vienna-tachyon publishes for) is our substrate.
-#
 # Teardown runs unconditionally and publishes cacheserver logs as an artifact
 # so failures are debuggable.
 

@@ -8,23 +8,18 @@
 #                              the main chart.
 #   2. cache-server         - the actual StatefulSet + Service.
 #
-# We intentionally do NOT check out the vienna-tachyon source repo, because
-# both charts are published to the ACR that also hosts the cache-server image.
-# Helm 3.8+ has OCI support built in; install-prereqs.sh installs a fresh
-# enough Helm.
-#
 # Overrides we set on top of the main chart's baked-in values.yaml:
 #   * cacheServer.image.repository / .tag  - use the ACR-hosted image
 #   * cacheServer.numServers               - match CACHE_SERVER_REPLICAS
 #   * cacheServer.scheduler.enabled=false  - blobfuse2 E2E tests do NOT need
 #                                             the scheduler component
 #
-# Substrate note: upstream uses `minikube image load`; we `docker save` the
-# image and drive `ctr images import` on each kind node directly. We do NOT
-# use `kind load` (either variant) because it hardcodes
-# `ctr images import --all-platforms`, which fails with
-# `ctr: content digest ...: not found` when the archive from Docker's
-# containerd image store references platforms whose blobs weren't pulled.
+# Image side-load note: we `docker save` the image and drive
+# `ctr images import` on each kind node directly. We do NOT use `kind load`
+# (either variant) because it hardcodes `ctr images import --all-platforms`,
+# which fails with `ctr: content digest ...: not found` when the archive
+# from Docker's containerd image store references platforms whose blobs
+# weren't pulled.
 
 set -euo pipefail
 
@@ -48,15 +43,75 @@ if [[ -z "${CACHE_SERVER_IMAGE_REGISTRY:-}" ]]; then
     exit 1
 fi
 
+# CACHE_SERVER_CHART_REGISTRY defaults to the image registry (see
+# nightly.config), but that default only kicks in when the config was sourced
+# with CACHE_SERVER_IMAGE_REGISTRY already set. In the pipeline the ADO
+# variable can be an empty string ('' in YAML), which suppresses the default
+# and leaves CACHE_SERVER_CHART_REGISTRY empty even after we've established
+# CACHE_SERVER_IMAGE_REGISTRY above. Re-apply the fallback here.
+: "${CACHE_SERVER_CHART_REGISTRY:=$CACHE_SERVER_IMAGE_REGISTRY}"
+
+# Empty _TAG / _CHART_VERSION mean "resolve latest from ACR at runtime".
+# This lets the nightly pipeline always exercise whatever cache-server /
+# chart build is currently published, without needing a pipeline edit
+# every time a new version drops.
+NEED_ACR_RESOLVE=false
 if [[ -z "${CACHE_SERVER_IMAGE_TAG:-}" ]]; then
-    echo "ERROR: CACHE_SERVER_IMAGE_TAG is empty." >&2
-    exit 1
+    NEED_ACR_RESOLVE=true
+fi
+if [[ -z "${CACHE_SERVER_CHART_VERSION:-}" ]]; then
+    NEED_ACR_RESOLVE=true
 fi
 
+if [[ "$NEED_ACR_RESOLVE" == "true" ]]; then
+    if ! command -v az >/dev/null 2>&1; then
+        echo "ERROR: az CLI not found; cannot resolve latest tag from ACR." >&2
+        echo "       Either install az (and run 'az login') or set" >&2
+        echo "       CACHE_SERVER_IMAGE_TAG and CACHE_SERVER_CHART_VERSION" >&2
+        echo "       explicitly." >&2
+        exit 1
+    fi
+fi
+
+# Resolve latest image tag if not pinned. `az acr repository show-tags` uses
+# time-based ordering (`time_desc` = newest push first), which matches how
+# the Tachyon ACR publishes sequential CI builds.
+if [[ -z "${CACHE_SERVER_IMAGE_TAG:-}" ]]; then
+    ACR_NAME_FOR_IMAGE="${CACHE_SERVER_IMAGE_REGISTRY%%.*}"
+    echo "Resolving latest image tag for $CACHE_SERVER_IMAGE_REGISTRY/$CACHE_SERVER_IMAGE_REPO ..."
+    CACHE_SERVER_IMAGE_TAG="$(az acr repository show-tags \
+        --name "$ACR_NAME_FOR_IMAGE" \
+        --repository "$CACHE_SERVER_IMAGE_REPO" \
+        --orderby time_desc --top 1 --output tsv 2>/dev/null || true)"
+    if [[ -z "$CACHE_SERVER_IMAGE_TAG" ]]; then
+        echo "ERROR: failed to resolve latest tag for" \
+             "$CACHE_SERVER_IMAGE_REGISTRY/$CACHE_SERVER_IMAGE_REPO from ACR." >&2
+        echo "       Confirm 'az login' + AcrPull on the registry, or set" >&2
+        echo "       CACHE_SERVER_IMAGE_TAG explicitly." >&2
+        exit 1
+    fi
+    echo "Resolved latest image tag: $CACHE_SERVER_IMAGE_TAG"
+fi
+
+# Resolve latest chart version if not pinned. Chart versions in OCI ACRs are
+# stored as artifact tags on the chart repository, so the same `show-tags`
+# query works. We pull the latest tag for the main cache-server chart and use
+# it for the prereq chart too (contract: they are published in lockstep).
 if [[ -z "${CACHE_SERVER_CHART_VERSION:-}" ]]; then
-    echo "ERROR: CACHE_SERVER_CHART_VERSION is empty." >&2
-    echo "       Set the exact chart version (e.g. 1.2.3) published to the ACR." >&2
-    exit 1
+    ACR_NAME_FOR_CHART="${CACHE_SERVER_CHART_REGISTRY%%.*}"
+    echo "Resolving latest chart version for $CACHE_SERVER_CHART_REGISTRY/$CACHE_SERVER_CHART_REPO ..."
+    CACHE_SERVER_CHART_VERSION="$(az acr repository show-tags \
+        --name "$ACR_NAME_FOR_CHART" \
+        --repository "$CACHE_SERVER_CHART_REPO" \
+        --orderby time_desc --top 1 --output tsv 2>/dev/null || true)"
+    if [[ -z "$CACHE_SERVER_CHART_VERSION" ]]; then
+        echo "ERROR: failed to resolve latest chart version for" \
+             "$CACHE_SERVER_CHART_REGISTRY/$CACHE_SERVER_CHART_REPO from ACR." >&2
+        echo "       Confirm 'az login' + AcrPull on the registry, or set" >&2
+        echo "       CACHE_SERVER_CHART_VERSION explicitly." >&2
+        exit 1
+    fi
+    echo "Resolved latest chart version: $CACHE_SERVER_CHART_VERSION"
 fi
 
 CACHE_SERVER_IMAGE="${CACHE_SERVER_IMAGE_REGISTRY}/${CACHE_SERVER_IMAGE_REPO}:${CACHE_SERVER_IMAGE_TAG}"

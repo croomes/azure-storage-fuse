@@ -12,7 +12,7 @@
 #       2. Prepare /var/lib/ssd/cacheserver on every node container. The
 #          Helm chart's `useHostPath: true` value points here and the pod
 #          fails to schedule if the directory does not already exist.
-#          `docker exec` is the kind equivalent of `minikube ssh -n <node>`.
+#          `docker exec <node>` shells into each kind node container.
 #
 # Keep the labeling + hostPath prep in sync with the assumptions in
 # vienna-tachyon/helm/cache-server/values.yaml.

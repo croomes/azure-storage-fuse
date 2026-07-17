@@ -9,10 +9,6 @@ They are invoked from `azure-pipeline-templates/dist-cache-e2e.yml` in the
 nightly build, but are self-contained enough to run locally for iterative
 debugging.
 
-See [PLAN.md](PLAN.md) for the design rationale (in particular §1 on why we
-chose kind over minikube even though the upstream vienna-tachyon tooling
-targets minikube).
-
 ## Files
 
 | File | Purpose |
@@ -33,16 +29,21 @@ targets minikube).
 
 # 2. Set the image + chart coordinates. The chart is pulled from an
 #    OCI-enabled ACR; no source checkout of vienna-tachyon is required.
-export CACHE_SERVER_IMAGE_REGISTRY=<acr-name>.azurecr.io
+#    Registry defaults to tachyonprodacr.azurecr.io (see config/nightly.config).
+export CACHE_SERVER_IMAGE_REGISTRY=<acr-name>.azurecr.io   # optional; default: tachyonprodacr.azurecr.io
 export CACHE_SERVER_IMAGE_REPO=cache-server
-export CACHE_SERVER_IMAGE_TAG=<image-tag>
+# Leave CACHE_SERVER_IMAGE_TAG empty to let deploy-tachyon.sh resolve the
+# latest tag from ACR at runtime; pin it for reproducible local runs.
+export CACHE_SERVER_IMAGE_TAG=<image-tag>                  # optional; empty = latest from ACR
 
 # Chart registry defaults to CACHE_SERVER_IMAGE_REGISTRY; override if the
 # chart is in a different ACR.
 # export CACHE_SERVER_CHART_REGISTRY=<other-acr>.azurecr.io
 export CACHE_SERVER_CHART_REPO=charts/cache-server
 export CACHE_SERVER_PREREQ_CHART_REPO=charts/cache-server-prereq
-export CACHE_SERVER_CHART_VERSION=<chart-version>
+# Leave CACHE_SERVER_CHART_VERSION empty to let deploy-tachyon.sh resolve
+# the latest chart version from ACR at runtime.
+export CACHE_SERVER_CHART_VERSION=<chart-version>          # optional; empty = latest from ACR
 
 # If the ACR is private, log in first (deploy-tachyon.sh does NOT do this):
 #   az acr login --name <acr-name>
@@ -83,6 +84,3 @@ export DCACHE_SERVERS=$(cat "$DCACHE_SERVER_LIST_FILE")
 - `expose-cacheserver.sh` runs `kubectl port-forward` in the background and
   polls the local port with `nc -z` before returning, so callers can assume the
   ports are actually listening once the script exits.
-- Nothing here needs `MINIKUBE_HOME` or `/mnt/minikube`. kind stores node
-  container state under Docker's data-root -- if `/` is tight on the agent,
-  point Docker's data-root at `/mnt/docker` via `/etc/docker/daemon.json`.
